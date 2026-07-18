@@ -1,0 +1,72 @@
+# Configuration File for Computer Vision Project
+
+# Dataset Configuration
+dataset:
+  name: cifar10  # Options: cifar10, custom, imagenet
+  path: data/cifar10
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+
+# Model Configuration
+model:
+  type: resnet50  # Options: resnet18, resnet50, efficientnet, vgg16, densenet
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+  
+# Training Configuration
+training:
+  device: cuda  # Options: cuda, cpu
+  epochs: 100
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  momentum: 0.9
+  scheduler: cosine  # Options: cosine, step, exponential
+  optimizer: adam  # Options: adam, sgd, adamw
+  
+# Data Augmentation
+augmentation:
+  enabled: true
+  random_flip: true
+  random_rotation: 15
+  color_jitter: true
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.1
+  
+# Object Detection Configuration
+detection:
+  model: yolov3  # Options: yolov3, yolov5, yolov8
+  confidence_threshold: 0.5
+  iou_threshold: 0.4
+  max_detections: 100
+  
+# Face Recognition Configuration
+face_recognition:
+  model: facenet  # Options: facenet, vggface2, arcface
+  detection_confidence: 0.7
+  recognition_threshold: 0.6
+  
+# Inference Configuration
+inference:
+  mode: image  # Options: image, video, webcam
+  save_outputs: true
+  output_dir: outputs/
+  visualize: true
+  
+# Logging Configuration
+logging:
+  level: INFO  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_file: logs/project.log
+  tensorboard: true
+  tensorboard_dir: runs/
+
+# Checkpoint & Model Saving
+checkpoint:
+  save_interval: 5  # Save every N epochs
+  save_best: true
+  save_dir: models/weights/
+  keep_top_k: 3  # Keep top K models
