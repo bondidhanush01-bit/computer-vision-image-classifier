@@ -1,218 +1,149 @@
 """
-FastAPI application for the Computer Vision Image Classifier project.
-
-Exposes three endpoints, matching the ones documented in the project README:
-  - POST /classify  -> image classification
-  - POST /detect    -> object detection
-  - POST /recognize -> face detection + (placeholder) recognition
+FastAPI app exposing the image classifier, object detector, and face recognizer
+defined in src/inference.py.
 
 Run with:
-    cd api
-    pip install -r requirements.txt
     uvicorn app:app --reload --host 0.0.0.0 --port 8000
+
+Then visit http://127.0.0.1:8000/docs for interactive API docs.
 """
 
 import logging
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# Make the project root (parent of api/) importable so `from src...` works
-# regardless of the working directory the server is launched from.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.inference import FaceRecognizer, ImageClassifier, ObjectDetector  # noqa: E402
-from src.utils import get_device, load_config  # noqa: E402
+from src.inference import FaceRecognizer, ImageClassifier, ObjectDetector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Computer Vision Image Classifier API",
-    description="Image classification, object detection, and face recognition over REST",
+    title="Computer Vision API",
+    description="Image classification, object detection, and face recognition",
     version="1.0.0",
 )
 
-# Load config (falls back to sane defaults if config.yaml is missing/unreadable)
-try:
-    _config = load_config(str(PROJECT_ROOT / "config.yaml"))
-except Exception as exc:  # noqa: BLE001
-    logger.warning(f"Could not load config.yaml, using defaults: {exc}")
-    _config = {}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-_device = get_device()
-
-# Models are created lazily on first request so the API starts up fast and
-# doesn't pay the cost of loading every model if you only ever use one endpoint.
-_classifier: Optional[ImageClassifier] = None
-_detector: Optional[ObjectDetector] = None
-_face_recognizer: Optional[FaceRecognizer] = None
-
-ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg", "image/bmp", "image/webp"}
+# Models are loaded once at startup and reused across requests, so we don't
+# reload weights on every call.
+classifier: Optional[ImageClassifier] = None
+detector: Optional[ObjectDetector] = None
+face_recognizer: Optional[FaceRecognizer] = None
 
 
-def get_classifier() -> ImageClassifier:
-    global _classifier
-    if _classifier is None:
-        model_cfg = _config.get("model", {})
-        logger.info("Loading ImageClassifier...")
-        _classifier = ImageClassifier(
-            model_type=model_cfg.get("type", "resnet50"),
-            num_classes=model_cfg.get("num_classes", 10),
-            device=_device,
-        )
-    return _classifier
+@app.on_event("startup")
+def load_models() -> None:
+    global classifier, detector, face_recognizer
+    logger.info("Loading models...")
+
+    # NOTE: no model_path is passed here, so ImageClassifier uses ImageNet-
+    # pretrained backbone weights with a freshly-initialized (untrained) final
+    # layer for 10 classes. Predictions will be meaningless until you point
+    # model_path at a checkpoint trained with src/train.py. This is enough to
+    # get the API running end-to-end though.
+    classifier = ImageClassifier(model_type="resnet50", num_classes=10, device="cpu")
+
+    # These two can fail to fully initialize (e.g. missing yolov3 weights or
+    # mediapipe not installed) without raising -- inference.py logs an error
+    # and leaves .model / .face_detection as None in that case, which the
+    # endpoints below check for.
+    detector = ObjectDetector()
+    face_recognizer = FaceRecognizer()
+
+    logger.info("Models loaded.")
 
 
-def get_detector() -> ObjectDetector:
-    global _detector
-    if _detector is None:
-        det_cfg = _config.get("detection", {})
-        logger.info("Loading ObjectDetector...")
-        _detector = ObjectDetector(
-            model_name=det_cfg.get("model", "yolov8n"),
-            confidence=det_cfg.get("confidence_threshold", 0.5),
-            iou_threshold=det_cfg.get("iou_threshold", 0.4),
-        )
-    return _detector
-
-
-def get_face_recognizer() -> FaceRecognizer:
-    global _face_recognizer
-    if _face_recognizer is None:
-        face_cfg = _config.get("face_recognition", {})
-        logger.info("Loading FaceRecognizer...")
-        _face_recognizer = FaceRecognizer(
-            detection_confidence=face_cfg.get("detection_confidence", 0.7),
-        )
-    return _face_recognizer
-
-
-def _save_upload_to_tempfile(file: UploadFile) -> Path:
-    """Validate and persist an uploaded image to a temp file, returning its path."""
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported content type '{file.content_type}'. "
-                   f"Allowed: {sorted(ALLOWED_CONTENT_TYPES)}",
-        )
-
-    suffix = Path(file.filename or "upload.jpg").suffix or ".jpg"
+def _save_upload_to_temp(upload: UploadFile) -> Path:
+    suffix = Path(upload.filename or "").suffix or ".jpg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    try:
-        shutil.copyfileobj(file.file, tmp)
-    finally:
-        tmp.close()
-        file.file.close()
-
+    with tmp as f:
+        shutil.copyfileobj(upload.file, f)
     return Path(tmp.name)
 
 
 @app.get("/")
 def root():
-    """Basic health/info endpoint."""
-    return {
-        "service": "Computer Vision Image Classifier API",
-        "status": "ok",
-        "device": _device,
-        "endpoints": ["/classify", "/detect", "/recognize", "/health"],
-    }
+    return {"status": "ok", "message": "Computer Vision API is running"}
 
 
 @app.get("/health")
 def health():
-    """Health check endpoint for uptime monitoring / container orchestration."""
-    return {"status": "healthy"}
+    return {
+        "status": "ok",
+        "classifier_loaded": classifier is not None,
+        "detector_loaded": detector is not None and detector.model is not None,
+        "face_recognizer_loaded": (
+            face_recognizer is not None and face_recognizer.face_detection is not None
+        ),
+    }
 
 
 @app.post("/classify")
 async def classify_image(file: UploadFile = File(...), top_k: int = 5):
-    """
-    Classify an uploaded image.
+    if classifier is None:
+        raise HTTPException(status_code=503, detail="Classifier not loaded")
 
-    Args:
-        file: Image file (jpg/png/etc.)
-        top_k: Number of top predictions to return (default 5)
-    """
-    tmp_path = _save_upload_to_tempfile(file)
+    image_path = _save_upload_to_temp(file)
     try:
-        classifier = get_classifier()
-        result = classifier.predict(str(tmp_path), top_k=top_k)
-        return JSONResponse(content=result)
-    except Exception as exc:  # noqa: BLE001
+        return classifier.predict(str(image_path), top_k=top_k)
+    except Exception as e:
         logger.exception("Classification failed")
-        raise HTTPException(status_code=500, detail=f"Classification failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        tmp_path.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
 
 
 @app.post("/detect")
-async def detect_objects(file: UploadFile = File(...), confidence: Optional[float] = None):
-    """
-    Detect objects in an uploaded image.
+async def detect_objects(file: UploadFile = File(...), confidence: float = 0.5):
+    if detector is None or detector.model is None:
+        raise HTTPException(status_code=503, detail="Object detector not loaded")
 
-    Args:
-        file: Image file (jpg/png/etc.)
-        confidence: Optional confidence threshold override
-    """
-    tmp_path = _save_upload_to_tempfile(file)
+    image_path = _save_upload_to_temp(file)
     try:
-        detector = get_detector()
-        detections = detector.detect(str(tmp_path), confidence=confidence)
-
-        # Convert numpy types to plain Python so the response is JSON-serializable
-        serializable = []
-        for det in detections:
-            bbox = det["bbox"]
-            serializable.append({
-                "bbox": [float(v) for v in bbox],
-                "confidence": float(det["confidence"]),
-                "class": int(det["class"]),
-                "class_name": det["class_name"],
-            })
-
-        return JSONResponse(content={"detections": serializable, "count": len(serializable)})
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Object detection failed")
-        raise HTTPException(status_code=500, detail=f"Detection failed: {exc}")
+        detections = detector.detect(str(image_path), confidence=confidence)
+        # bbox arrives as a numpy array; make it JSON-serializable
+        for d in detections:
+            d["bbox"] = [float(v) for v in d["bbox"]]
+        return {"detections": detections, "count": len(detections)}
+    except Exception as e:
+        logger.exception("Detection failed")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        tmp_path.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
 
 
-@app.post("/recognize")
-async def recognize_faces(file: UploadFile = File(...)):
-    """
-    Detect and (placeholder) recognize faces in an uploaded image.
+@app.post("/faces")
+async def detect_faces(file: UploadFile = File(...)):
+    if face_recognizer is None or face_recognizer.face_detection is None:
+        raise HTTPException(status_code=503, detail="Face recognizer not loaded")
 
-    Args:
-        file: Image file (jpg/png/etc.)
-    """
-    tmp_path = _save_upload_to_tempfile(file)
+    image_path = _save_upload_to_temp(file)
     try:
-        recognizer = get_face_recognizer()
-        faces = recognizer.detect_faces(str(tmp_path))
-        identities = recognizer.recognize(faces)
-
-        serializable = []
-        for identity in identities:
-            serializable.append({
-                "face_id": identity["face_id"],
-                "bbox": [int(v) for v in identity["bbox"]],
-                "confidence": float(identity["confidence"]),
-                "identity": identity["identity"],
-                "match_confidence": float(identity["match_confidence"]),
-            })
-
-        return JSONResponse(content={"faces": serializable, "count": len(serializable)})
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Face recognition failed")
-        raise HTTPException(status_code=500, detail=f"Recognition failed: {exc}")
+        faces = face_recognizer.detect_faces(str(image_path))
+        recognized = face_recognizer.recognize(faces)
+        response = [
+            {
+                "face_id": r["face_id"],
+                "bbox": list(r["bbox"]),
+                "confidence": float(r["confidence"]),
+                "identity": r["identity"],
+            }
+            for r in recognized
+        ]
+        return {"faces": response, "count": len(response)}
+    except Exception as e:
+        logger.exception("Face detection failed")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        tmp_path.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
